@@ -1113,6 +1113,19 @@ export type AgentOptions<Env> = PartyServerOptions<Env> & {
   cors?: boolean | HeadersInit | undefined;
 };
 
+export interface AgentEmailRouteOptions<Env> extends AgentOptions<Env> {
+  /**
+   * Custom function to resolve the target agent and name from a message. If
+   * this returns a value it overrides all built in routing logic.
+   */
+  resolver?: (
+    email: ForwardableEmailMessage,
+    env: Env
+  ) => Promise<{ agent: string; name: string } | undefined>;
+  /** Domain used for plus address parsing */
+  domain?: string;
+}
+
 /**
  * Route a request to the appropriate Agent
  * @param request Request to route
@@ -1177,11 +1190,138 @@ export async function routeAgentRequest<Env>(
  * @param env Environment containing Agent bindings
  * @param options Routing options
  */
+/**
+ * Decode a Base64 encoded string into the hex representation expected by
+ * `idFromString`. We use Buffer here so the helper works both in Workers and
+ * in Node based tests.
+ */
+function base64ToHex(str: string) {
+  return Buffer.from(str, "base64").toString("hex");
+}
+
+const namespaceCache: WeakMap<object, DurableObjectNamespace[]> = new WeakMap();
+
+/**
+ * Return all Durable Object namespaces bound in the worker. The result is
+ * cached similar to how `routePartykitRequest` builds its map.
+ */
+function getNamespaces(env: unknown): DurableObjectNamespace[] {
+  if (!namespaceCache.has(env as object)) {
+    const namespaces = Object.values(env as Record<string, unknown>).filter(
+      (v): v is DurableObjectNamespace =>
+        !!v &&
+        typeof v === "object" &&
+        "idFromString" in v &&
+        typeof (v as DurableObjectNamespace).idFromString === "function" &&
+        typeof (v as DurableObjectNamespace).get === "function"
+    );
+    namespaceCache.set(env as object, namespaces);
+  }
+  return namespaceCache.get(env as object)!;
+}
+
+/**
+ * Attempt to decode the given hex Durable Object id with each namespace until
+ * one succeeds. This lets us locate the correct namespace without knowing the
+ * class ahead of time.
+ */
+function findNamespace(env: unknown, id: string): DurableObjectNamespace {
+  for (const ns of getNamespaces(env)) {
+    try {
+      ns.idFromString(id);
+      return ns;
+    } catch {
+      // ignore and try next
+    }
+  }
+  throw new Error("No DurableObjectNamespace found for id");
+}
+
+/**
+ * Convert a kebab-case string (used when parsing plus addresses) back into the
+ * PascalCase form used for Durable Object bindings.
+ */
+function kebabToPascal(str: string) {
+  return str
+    .split("-")
+    .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+    .join("");
+}
+
+export async function routeAgentEmailRequest<Env>(
+  email: ForwardableEmailMessage,
+  env: Env,
+  options?: AgentEmailRouteOptions<Env>
+) {
+  let target: { agent: string; name: string } | undefined;
+
+  if (options?.resolver) {
+    target = await options.resolver(email, env);
+  }
+
+  if (!target) {
+    // Replies to emails previously sent by an Agent include the original
+    // `Message-ID` in either the `References` or `In-Reply-To` headers. When an
+    // Agent sends mail it should encode its Durable Object id in that
+    // `Message-ID`, so here we attempt to recover that id and route directly.
+    const refs =
+      email.headers.get("references") || email.headers.get("in-reply-to");
+    // The token looks like <BASE64_DO_ID@domain>; extract the base64 portion
+    // which is 43 characters long with a trailing `=`.
+    const match = refs?.match(/<([A-Za-z0-9+\/]{43}=)@.+>/);
+    if (match) {
+      const hex = base64ToHex(match[1]);
+      const ns = findNamespace(env, hex);
+      const id = ns.idFromString(hex);
+      const stub = ns.get(id);
+      // Forward the original MIME message to the agent's `/email` endpoint so
+      // the Agent can parse it however it likes.
+      await stub.fetch("/email", {
+        method: "POST",
+        headers: email.headers,
+        body: email.raw,
+      });
+      return;
+    }
+  }
+
+  if (!target && options?.domain) {
+    // For catch-all setups like agent-name+instance@domain we parse the local
+    // part to discover which agent and instance should receive the message.
+    const to = email.to;
+    if (to) {
+      const [local, domain] = to.split("@");
+      if (domain && domain.toLowerCase() === options.domain.toLowerCase()) {
+        const [agent, name] = local.split("+");
+        if (agent && name) {
+          target = { agent: kebabToPascal(agent), name };
+        }
+      }
+    }
+  }
+
+  if (target) {
+    const namespace = (env as Record<string, unknown>)[
+      target.agent
+    ] as DurableObjectNamespace;
+    const stub = await getAgentByName(namespace, target.name);
+    // Deliver the raw email to the resolved Agent instance
+    await stub.fetch("/email", {
+      method: "POST",
+      headers: email.headers,
+      body: email.raw,
+    });
+    return;
+  }
+}
+
 export async function routeAgentEmail<Env>(
   email: ForwardableEmailMessage,
   env: Env,
-  options?: AgentOptions<Env>
-): Promise<void> {}
+  options?: AgentEmailRouteOptions<Env>
+) {
+  return routeAgentEmailRequest(email, env, options);
+}
 
 /**
  * Get or create an Agent by name
